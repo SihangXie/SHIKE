@@ -6,10 +6,10 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 import cv2
-import  matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 from PIL import Image
 
-from utils import to_categorical
+from utils import to_categorical, create_logger
 
 
 class IMBALANCECIFAR10(torchvision.datasets.CIFAR10):

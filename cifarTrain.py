@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 import shutil
+import numpy as np
 from tkinter import N
 from turtle import color
 
@@ -49,7 +50,7 @@ parser.add_argument('--learning_rate', default=0.05)
 parser.add_argument('--seed', default=123, help='keep all seeds fixed')
 parser.add_argument('--re_train', default=True, help='implement cRT')
 parser.add_argument('--cornerstone', default=180)
-parser.add_argument('--num_exps', default=3, help='exps')
+parser.add_argument('--num_exps', default=3, help='number of experts')
 parser.add_argument('-e',
                     '--evaluate',
                     dest='evaluate',
@@ -65,7 +66,7 @@ args = parser.parse_args()
 
 
 def main():
-
+    os.environ['CUDA_VISIBLE_DEVICES'] = '3,4'  # 调试用
     if not os.path.exists(args.outf):
         os.makedirs(args.outf)
 
@@ -74,10 +75,10 @@ def main():
     set_seed(args.seed)
 
     # imbalance distribution
-    # img_max * (imb_factor ** (cls_idx / (cls_num - 1.0)))
-    num = np.array([int(np.floor(500 * (0.01 ** (i / (100 - 1.0)))))
-                   for i in range(100)])
-    args.label_dis = num
+    # img_max * (imb_factor ** (cls_idx / (cls_num - 1.0))) 不平衡度为100
+    num = np.array([int(np.floor(500 * (0.01 ** (i / (100 - 1.0)))))  # `**`是幂运算
+                    for i in range(100)])
+    args.label_dis = num  # 每类的样本数
 
     train_set = IMBALANCECIFAR100(root='./datasets/data', imb_factor=0.01,
                                   rand_number=0, train=True, transform=data_transforms['advanced_train'])
@@ -90,19 +91,20 @@ def main():
     test_loader = torch.utils.data.DataLoader(test_set,
                                               batch_size=args.batch_size,
                                               shuffle=True,
-                                              num_workers=16)
+                                              num_workers=0)
     print('size of testset_data:{}'.format(test_set.__len__()))
-    best_acc1 = .0
+    best_acc1 = .0  # 最佳精度1
 
     model = resnet32(num_classes=100, use_norm=True,
                      num_exps=args.num_exps).to(device)
+    model = torch.nn.DataParallel(model, device_ids=[0, 1])
 
     # optimizers and schedulers for decoupled training
-    optimizer_feat = optim.SGD(
+    optimizer_feat = optim.SGD(  # 骨干特征提取网络的优化器
         model.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=5e-4)
-    optimizer_crt = optim.SGD(
+    optimizer_crt = optim.SGD(  # 分类器的优化器
         model.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=5e-4)
-    scheduler_feat = CosineAnnealingLRWarmup(
+    scheduler_feat = CosineAnnealingLRWarmup(  # 骨干特征提取网络的学习率调度器
         optimizer=optimizer_feat,
         T_max=args.epochs - 20,
         eta_min=0.0,
@@ -110,7 +112,7 @@ def main():
         base_lr=args.learning_rate,
         warmup_lr=0.15
     )
-    scheduler_crt = CosineAnnealingLRWarmup(
+    scheduler_crt = CosineAnnealingLRWarmup(  # 分类器的学习率调度器
         optimizer=optimizer_crt,
         T_max=20,
         eta_min=0.0,
@@ -119,22 +121,22 @@ def main():
         warmup_lr=0.1
     )
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().cuda()  # 损失函数经典交叉熵损失
 
     if args.evaluate:
         validate(test_loader, model, criterion, 179, args)
         return
 
     # proceeding with torch apex
-    scaler = GradScaler()
+    scaler = GradScaler()  # 创建GradScaler对象，自动混合精度，提速
 
     for epoch in range(0, args.epochs):  # args.start_epoch
 
         # freezing shared parameters
-        if epoch >= args.cornerstone:
+        if epoch >= args.cornerstone:  # 从第180个epoch开始冻结所有共享参数s
             for name, param in model.named_parameters():
                 if name[:14] != "rt_classifiers":  # DDP NAME module.classifiers
-                    param.requires_grad = False
+                    param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
 
         # train for one epoch
         train(train_loader if epoch >= args.cornerstone else train_loader, model, scaler,
@@ -152,6 +154,8 @@ def main():
         # record best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
+        if is_best:
+            print("Epoch {}, best acc1 = {}".format(epoch, best_acc1))
 
         save_checkpoint(
             {
@@ -164,62 +168,62 @@ def main():
 
 
 def mix_outputs(outputs, labels, balance=False, label_dis=None):
-    logits_rank = outputs[0].unsqueeze(1)
-    for i in range(len(outputs) - 1):
-        logits_rank = torch.cat(
-            (logits_rank, outputs[i+1].unsqueeze(1)), dim=1)
+    logits_rank = outputs[0].unsqueeze(1)  # 在第二维上插入1个新的维度作为logits排名
+    for i in range(len(outputs) - 1):  # i取值(0, 1)
+        logits_rank = torch.cat(  # 水平方向拼接logits排名(bs, 3, 100)
+            (logits_rank, outputs[i + 1].unsqueeze(1)), dim=1)  # 其实就是把3个专家的分类头输出拼接到一个(bs, 3, 100)的张量
 
-    max_tea, max_idx = torch.max(logits_rank, dim=1)
+    max_tea, max_idx = torch.max(logits_rank, dim=1)  # 获取同一个类中，3个专家logits值最高的值与专家的索引作为教师模型teacher
     # min_tea, min_idx = torch.min(logits_rank, dim=1)
 
-    non_target_labels = torch.ones_like(labels) - labels
+    non_target_labels = torch.ones_like(labels) - labels  # 获取non target labels，target logit值会变0，相当于掩码
 
-    avg_logits = torch.sum(logits_rank, dim=1) / len(outputs)
-    non_target_logits = (-30 * labels) + avg_logits * non_target_labels
+    avg_logits = torch.sum(logits_rank, dim=1) / len(outputs)  # 计算3个专家输出的logits的均值(沿专家维度算平均值)
+    non_target_logits = (-30 * labels) + avg_logits * non_target_labels  # 【重要】×-30后target logit值会变-30.基于平均logits，计算non target logits
 
-    _hardest_nt, hn_idx = torch.max(non_target_logits, dim=1)
+    _hardest_nt, hn_idx = torch.max(non_target_logits, dim=1)  # 【重要】计算`consensus hardest negative class`及其索引
 
-    hardest_idx = torch.zeros_like(labels)
-    hardest_idx.scatter_(1, hn_idx.data.view(-1, 1), 1)
-    hardest_logit = non_target_logits * hardest_idx
+    hardest_idx = torch.zeros_like(labels)  # 创建形状与真实标签相同的0值张量作为`consensus hardest negative class`的索引张量
+    hardest_idx.scatter_(1, hn_idx.data.view(-1, 1), 1)  # 把`consensus hardest negative class`的索引位置置1，其余为0
+    hardest_logit = non_target_logits * hardest_idx  # `consensus hardest negative class`的值
 
-    rest_nt_logits = max_tea * (1 - hardest_idx) * (1 - labels)
-    reformed_nt = rest_nt_logits + hardest_logit
+    rest_nt_logits = max_tea * (1 - hardest_idx) * (1 - labels)  # 排除target logit和consensus hardest negative class的剩余最大non target logits
+    reformed_nt = rest_nt_logits + hardest_logit  # 【重要】得到全部non target logits的值作为教师模型
 
-    preds = [F.softmax(logits) for logits in outputs]
+    preds = [F.softmax(logits) for logits in outputs]  # 计算三个专家原始输出的prediction
 
-    reformed_non_targets = []
-    for i in range(len(preds)):
-        target_preds = preds[i] * labels
+    reformed_non_targets = []  # 初始化空列别
+    for i in range(len(preds)):  # 循环3次
+        target_preds = preds[i] * labels  # 获取target的prediction值
 
-        target_preds = torch.sum(target_preds, dim=-1, keepdim=True)
-        target_min = -30 * labels
-        target_excluded_preds = F.softmax(
+        target_preds = torch.sum(target_preds, dim=-1, keepdim=True)  # 将其他99个0值清除
+        target_min = -30 * labels  # 还是没搞清楚为什么要乘-30？
+        target_excluded_preds = F.softmax(  # 计算排除了target logit的prediction
             outputs[i] * (1 - labels) + target_min)
-        reformed_non_targets.append(target_excluded_preds)
+        reformed_non_targets.append(target_excluded_preds)  # 把每个专家的non target prediction加到列表中
 
-    label_dis = torch.tensor(
+    label_dis = torch.tensor(  # 把每类的样本数转换成Tensor
         label_dis, dtype=torch.float, requires_grad=False).cuda()
-    label_dis = label_dis.unsqueeze(0).expand(labels.shape[0], -1)
+    label_dis = label_dis.unsqueeze(0).expand(labels.shape[0], -1)  # 把label_dis形状从(100,)修改成(bs, 100)
     loss = 0.0
-    if balance == True:
-        for i in range(len(outputs)):
+    if balance == True:  # epoch超过180进入该分支，表示训练分类器
+        for i in range(len(outputs)):  # 循环3次计算分类器损失，最后损失之求和
             loss += soft_entropy(outputs[i] + label_dis.log(), labels)
-    else:
-        for i in range(len(outputs)):
+    else:  # epoch小于180进入该分支，表示训练backbone
+        for i in range(len(outputs)):  # 循环3次
             # base ce
-            loss += soft_entropy(outputs[i], labels)
+            loss += soft_entropy(outputs[i], labels)  # 计算每个专家的交叉熵损失函数
             # hardest negative suppression
             loss += 10.0 * \
-                F.kl_div(
-                    torch.log(reformed_non_targets[i]), F.softmax(reformed_nt))
+                    F.kl_div(  # KL散度
+                        torch.log(reformed_non_targets[i]), F.softmax(reformed_nt))  # 计算每个专家的non target logits与教师模型的KL散度
             # mutual distillation loss
-            for j in range(len(outputs)):
+            for j in range(len(outputs)):  # DKF两两专家之间进行知识蒸馏
                 if i != j:
                     loss += F.kl_div(F.log_softmax(outputs[i]),
                                      F.softmax(outputs[j]))
 
-    avg_output = sum(outputs) / len(outputs)
+    avg_output = sum(outputs) / len(outputs)  # 计算多专家原始平均输出
     return loss, avg_output
 
 
@@ -247,28 +251,28 @@ def train(train_loader, model, scaler, optimizer, epoch, args):
 
         optimizer.zero_grad()
         # compute output
-        with autocast():
-            outputs = model(images, (epoch >= args.cornerstone))
+        with autocast():  # amp混合精度库前向传播
+            outputs = model(images, (epoch >= args.cornerstone))  # 前向传播使用torch.float16(2字节)精度
             loss, output = mix_outputs(outputs=outputs, labels=target, balance=(
-                epoch >= args.cornerstone), label_dis=args.label_dis)
-        _, target = torch.max(target.data, 1)
+                    epoch >= args.cornerstone), label_dis=args.label_dis)  # 计算损失值和3个专家的平均原始输出
+        _, target = torch.max(target.data, 1)  # 获取正确标签的索引
 
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))  # 计算本批次的top1和top5准确率
 
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1.item(), images.size(0))
-        top5.update(acc5.item(), images.size(0))
+        losses.update(loss.item(), images.size(0))  # 更新loss值计数器
+        top1.update(acc1.item(), images.size(0))  # 更新top1准确率计数器
+        top5.update(acc5.item(), images.size(0))  # 更新top5准确率计数器
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward(retain_graph=True)  # 使用float32进行反向传播，避免使用float16精度梯度下溢
         scaler.step(optimizer)
-        scaler.update()
-        
+        scaler.update()  # 更新网络参数
+
         # measure elapsed time
-        batch_time.update(time.time() - end)
+        batch_time.update(time.time() - end)  # 计算本batch训练耗时
         end = time.time()
 
-        if i % args.print_freq == 0:
+        if i % args.print_freq == 0:  # 每100个batch打印一次信息
             progress.display(i)
 
 
@@ -286,12 +290,12 @@ def validate(val_loader, model, criterion, epoch, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
-            images = images.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
+            images = images.cuda(non_blocking=False)
+            target = target.cuda(non_blocking=False)
 
             # compute output
             outputs = model(images, (epoch >= args.cornerstone))
-            output = sum(outputs) / len(outputs)
+            output = sum(outputs) / len(outputs)  # 每一个类的logit等于3个专家的平均值
 
             loss = criterion(output, target)
 
@@ -367,20 +371,20 @@ class ProgressMeter(object):
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
-def accuracy(output, target, topk=(1, )):
+def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
-        maxk = max(topk)
+        maxk = max(topk)  # 最大top k数
         batch_size = target.size(0)
 
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        _, pred = output.topk(maxk, 1, True, True)  # 获取logit前5大的logit值的索引
+        pred = pred.t()  # 矩阵转置
+        correct = pred.eq(target.view(1, -1).expand_as(pred))  # 把target的形状扩展成pred再计算相等bool矩阵
 
         res = []
-        for k in topk:
+        for k in topk:  # 循环2次，分别计算top1和top5准确率
             correct_k = correct[:k].contiguous(
-            ).view(-1).float().sum(0, keepdim=True)
+            ).view(-1).float().sum(0, keepdim=True)  # 切片操作后不连续，调用contiguous保证张量在内存里的连续
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 

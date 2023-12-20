@@ -3,6 +3,7 @@ import time
 
 import matplotlib.pyplot as plt
 import numpy
+import logging
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,10 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+
+
+def create_logger(args):
+    pass
 
 
 def to_categorical(y, num_classes=None):
@@ -61,9 +66,9 @@ def soft_entropy(input, target, reduction='mean'):
         loss.backward()
     """
     logsoftmax = nn.LogSoftmax(dim=1)
-    res = -target * logsoftmax(input)
+    res = -target * logsoftmax(input)  # 只计算target的logsoftmax，其实就是交叉熵损失
     if reduction == 'mean':
-        return torch.mean(torch.sum(res, dim=1))
+        return torch.mean(torch.sum(res, dim=1))  # 算batch size所有图片的平均损失值
     elif reduction == 'sum':
         return torch.sum(torch.sum(res, dim=1))
     else:
@@ -87,7 +92,7 @@ class CosineAnnealingLRWarmup(lr_scheduler._LRScheduler):
     def get_cos_lr(self):
         return [self.eta_min + (self.warmup_lr - self.eta_min) *
                 (1 + math.cos(math.pi * (self.last_epoch -
-                 self.warmup_epochs) / (self.T_max - self.warmup_epochs))) / 2
+                                         self.warmup_epochs) / (self.T_max - self.warmup_epochs))) / 2
                 / self.base_lr * base_lr
                 for base_lr in self.base_lrs]
 
@@ -102,4 +107,3 @@ class CosineAnnealingLRWarmup(lr_scheduler._LRScheduler):
             return self.get_warmup_lr()
         else:
             return self.get_cos_lr()
-

@@ -116,7 +116,9 @@ class ShallowExpert(nn.Module):
     def __init__(self, input_dim=None, depth=None) -> None:
         super(ShallowExpert, self).__init__()
         self.convs = nn.Sequential(
-            OrderedDict([(f'StridedConv{k}', StridedConv(in_planes=input_dim * (2 ** k), planes=input_dim * (2 ** (k + 1)), use_relu=(k != 1))) for
+            OrderedDict([(f'StridedConv{k}',
+                          StridedConv(in_planes=input_dim * (2 ** k), planes=input_dim * (2 ** (k + 1)),
+                                      use_relu=(k != 1))) for
                          k in range(depth)]))
 
     def forward(self, x):
@@ -139,46 +141,46 @@ class ResNet_MoE(nn.Module):
 
     def __init__(self, block, num_blocks, num_experts=None, num_classes=10, use_norm=False):
         super(ResNet_MoE, self).__init__()
-        self.s = 1
+        self.s = 1  # 共享层数？
         self.num_experts = num_experts
         self.in_planes = 16
         self.next_in_planes = 16
         self.conv1 = nn.Conv2d(3, 16, kernel_size=3,
                                stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(16)
-        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)  # 第一层深度共享
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)  # 第二层深度共享
 
-        if num_experts:
+        if num_experts:  # 第3个阶段是每个专家专属的特征
             layer3_output_dim = 64
             self.in_planes = 32
-            self.layer3s = nn.ModuleList([self._make_layer(
+            self.layer3s = nn.ModuleList([self._make_layer(  # 为3个专家分别构建3个layer3
                 block, layer3_output_dim, num_blocks[2], stride=2) for _ in range(self.num_experts)])
             self.in_planes = self.next_in_planes
             if use_norm:
-                self.s = 30
+                self.s = 30  # 所以这个s是什么？
                 self.classifiers = nn.ModuleList(
                     [NormedLinear(64, num_classes) for _ in range(self.num_experts)])
                 self.rt_classifiers = nn.ModuleList(
                     [NormedLinear(64, num_classes) for _ in range(self.num_experts)])
             else:
-                self.classifiers = nn.ModuleList(
+                self.classifiers = nn.ModuleList(  # 为3个专家分别构建3个分类头
                     [nn.Linear(64, num_classes, bias=True) for _ in range(self.num_experts)])
         else:
-            self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+            self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)  # 不使用多专家只构建1个layer3和1个分类器
             self.linear = NormedLinear(64, num_classes) if use_norm else nn.Linear(
                 64, num_classes, bias=True)
 
-        self.apply(_weights_init)
-        self.depth = list(
+        self.apply(_weights_init)  # 递归地对模块进行应用初始化
+        self.depth = list(  # 定义网络深度
             reversed([i + 1 for i in range(len(num_blocks) - 1)]))  # [2, 1]
-        self.exp_depth = [self.depth[i % len(self.depth)] for i in range(
+        self.exp_depth = [self.depth[i % len(self.depth)] for i in range(  # 定义专家分配到的网络深度
             self.num_experts)]  # [2, 1, 2]
         feat_dim = 16
-        self.shallow_exps = nn.ModuleList([ShallowExpert(
+        self.shallow_exps = nn.ModuleList([ShallowExpert(  # 构建浅层的专家的对齐下采样层
             input_dim=feat_dim * (2 ** (d % len(self.depth))), depth=d) for d in self.exp_depth])
 
-        self.shallow_avgpool = nn.AdaptiveAvgPool2d((8, 8))
+        self.shallow_avgpool = nn.AdaptiveAvgPool2d((8, 8))  # 自适应平均池化成形状为[bs, c, 8, 8]的张量
 
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
@@ -189,35 +191,36 @@ class ResNet_MoE(nn.Module):
             self.next_in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
-    def forward(self, x, crt=False):
+    def forward(self, x, crt=False):  # 入参crt表示是否分类器训练
 
         out = F.relu(self.bn1(self.conv1(x)))
 
-        out1 = self.layer1(out)
+        out1 = self.layer1(out)  # 第1个共享特征图[bs, 16, 32, 32]
 
-        out2 = self.layer2(out1)
-        shallow_outs = [out1, out2]
+        out2 = self.layer2(out1)  # 第2个共享特征图[bs, 32, 16, 16]
+        shallow_outs = [out1, out2]  # 2个不同深度的共享浅层特征
         if self.num_experts:
-            out3s = [self.layer3s[_](out2) for _ in range(self.num_experts)]
+            out3s = [self.layer3s[_](out2) for _ in range(self.num_experts)]  # 3个专家的专属层会形成一个输出列表，值都不一样
             shallow_expe_outs = [self.shallow_exps[i](
-                shallow_outs[i % len(shallow_outs)]) for i in range(self.num_experts)]
+                shallow_outs[i % len(shallow_outs)]) for i in range(self.num_experts)]  # 特征图形状对齐
 
-            exp_outs = [out3s[i] * shallow_expe_outs[i]
+            exp_outs = [out3s[i] * shallow_expe_outs[i]  # 对齐后的浅层共享特征与专家专属特征进行哈达玛积融合
                         for i in range(self.num_experts)]
-            exp_outs = [F.avg_pool2d(output, output.size()[3]).view(
-                output.size(0), -1) for output in exp_outs]
-            if crt == True:
+            exp_outs = [F.avg_pool2d(output, output.size()[3]).view(  # 全局平均池化(bs, 64, 1, 1)
+                output.size(0), -1) for output in exp_outs]  # 然后拉平(bs, 64)
+            if crt == True:  # 分类器训练
                 outs = [self.s * self.rt_classifiers[i]
-                        (exp_outs[i]) for i in range(self.num_experts)]
-            else:
-                outs = [self.s * self.classifiers[i]
-                        (exp_outs[i]) for i in range(self.num_experts)]
+                (exp_outs[i]) for i in range(self.num_experts)]
+            else:  # 特征提取网络训练
+                outs = [self.s * self.classifiers[i]  # 为什么要点乘`self.s`？分类器是`NormedLinear`
+                (exp_outs[i]) for i in range(self.num_experts)]  # 分类器输出(bs, 100)
         else:
             out3 = self.layer3(out2)
             out = F.avg_pool2d(out3, out3.size()[3]).view(out3.size(0), -1)
             outs = self.linear(out)
 
         return outs
+
 
 # for Cifar100-LT use
 
