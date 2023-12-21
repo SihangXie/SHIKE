@@ -118,8 +118,7 @@ class ShallowExpert(nn.Module):
         self.convs = nn.Sequential(
             OrderedDict([(f'StridedConv{k}',
                           StridedConv(in_planes=input_dim * (2 ** k), planes=input_dim * (2 ** (k + 1)),
-                                      use_relu=(k != 1))) for
-                         k in range(depth)]))
+                                      use_relu=(k != 1))) for k in range(depth)]))
 
     def forward(self, x):
         out = self.convs(x)

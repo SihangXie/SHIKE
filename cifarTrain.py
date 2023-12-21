@@ -91,13 +91,12 @@ def main():
     test_loader = torch.utils.data.DataLoader(test_set,
                                               batch_size=args.batch_size,
                                               shuffle=True,
-                                              num_workers=0)
+                                              num_workers=16)
     print('size of testset_data:{}'.format(test_set.__len__()))
     best_acc1 = .0  # 最佳精度1
 
     model = resnet32(num_classes=100, use_norm=True,
                      num_exps=args.num_exps).to(device)
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
 
     # optimizers and schedulers for decoupled training
     optimizer_feat = optim.SGD(  # 骨干特征提取网络的优化器
@@ -264,7 +263,7 @@ def train(train_loader, model, scaler, optimizer, epoch, args):
         top1.update(acc1.item(), images.size(0))  # 更新top1准确率计数器
         top5.update(acc5.item(), images.size(0))  # 更新top5准确率计数器
 
-        scaler.scale(loss).backward(retain_graph=True)  # 使用float32进行反向传播，避免使用float16精度梯度下溢
+        scaler.scale(loss).backward()  # 使用float32进行反向传播，避免使用float16精度梯度下溢
         scaler.step(optimizer)
         scaler.update()  # 更新网络参数
 
