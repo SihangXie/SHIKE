@@ -110,7 +110,7 @@ def main():
                     for i in range(100)])
     args.label_dis = num  # 每类的样本数
 
-    train_set = IMBALANCECIFAR100(root='./datasets/data', imb_factor=0.01,
+    train_set = IMBALANCECIFAR100(root='/home/og/XieSH/dataset/long-tailed/public', imb_factor=0.01,
                                   rand_number=0, train=True, transform=data_transforms['advanced_train'])
     if args.distributed:
         train_loader = torch.utils.data.DataLoader(train_set,
@@ -126,7 +126,7 @@ def main():
                                                    pin_memory=True,
                                                    num_workers=16)
     test_set = datasets.CIFAR100(
-        root='./datasets/data', train=False, download=True, transform=data_transforms['test'])
+        root='/home/og/XieSH/dataset/long-tailed/public', train=False, download=True, transform=data_transforms['test'])
     test_loader = torch.utils.data.DataLoader(test_set,
                                               batch_size=args.batch_size,
                                               shuffle=True,
