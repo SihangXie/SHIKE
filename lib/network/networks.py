@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn import Parameter
+from torch.cuda.amp import autocast as autocast, GradScaler
 
 
 def _weights_init(m):
@@ -191,6 +192,7 @@ class ResNet_MoE(nn.Module):
             self.next_in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
+    @autocast()
     def forward(self, x, crt=False):  # 入参crt表示是否分类器训练
 
         out = F.relu(self.bn1(self.conv1(x)))

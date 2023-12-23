@@ -20,16 +20,11 @@ def set_seed(seed):
     :param seed:
     :return:
     """
-    print(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-
-
-def create_logger(args):
-    pass
 
 
 def to_categorical(y, num_classes=None):

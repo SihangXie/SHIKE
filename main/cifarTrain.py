@@ -1,20 +1,23 @@
 import argparse
-import datetime
 import os
-import shutil
-import numpy as np
-from tkinter import N
-from turtle import color
+from datetime import datetime
+import _init_paths
+
+from utils.utils import get_logger
+import warnings
 
 import torch.optim as optim
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 
 from torch.cuda.amp import autocast as autocast, GradScaler
-from autoaugment import CIFAR10Policy, Cutout
-from datasets.imbalanced_cifar import *
-from networks import resnet32
-from utils import *
+from dataset.autoaugment import CIFAR10Policy, Cutout
+from dataset.imbalanced_cifar import *
+from network.networks import resnet32
+from utils.util import *
 
 # data transform settings
 normalize = transforms.Normalize(
@@ -42,7 +45,8 @@ data_transforms = {
 }
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR-LT Training')
-parser.add_argument('--outf', default='./outputs/', help='folder to output images and model checkpoints')
+parser.add_argument('--cfg_name', default='CIFAR100-LT-IF100', help='name of this configuration')
+parser.add_argument('--output_dir', default='/home/og/XieSH/models/SHIKE/output', help='folder to output images and model checkpoints')
 parser.add_argument('--pre_epoch', default=0, help='epoch for pre-training')
 parser.add_argument('--epochs', default=200, help='epoch for augmented training')
 parser.add_argument('--batch_size', default=128)
@@ -51,6 +55,10 @@ parser.add_argument('--seed', default=123, help='keep all seeds fixed')
 parser.add_argument('--re_train', default=True, help='implement cRT')
 parser.add_argument('--cornerstone', default=180)
 parser.add_argument('--num_exps', default=3, help='number of experts')
+parser.add_argument('--distributed', default=False, help='use distributed data parallel training or not')  # 是否启用分布式训练
+parser.add_argument('--local_rank', default=0, type=int, help='local_rank for distributed training')  # DDP训练的进程ID
+parser.add_argument('--world_size', default=2, type=int, help='number of processes for distributed training')  # DDP训练的进程总数
+parser.add_argument('--save_step', default=50, type=int, help='number of processes for distributed training')  # DDP训练的进程总数
 parser.add_argument('-e',
                     '--evaluate',
                     dest='evaluate',
@@ -66,13 +74,35 @@ args = parser.parse_args()
 
 
 def main():
-    os.environ['CUDA_VISIBLE_DEVICES'] = '3,4'  # 调试用
-    if not os.path.exists(args.outf):
-        os.makedirs(args.outf)
+    # os.environ['CUDA_VISIBLE_DEVICES'] = '3,4'  # 指定可用的GPU
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
+    rank = args.local_rank
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger = get_logger(args=args, rank=rank)
+    model_dir = os.path.join(args.output_dir, args.cfg_name, 'models',
+                             str(datetime.now().strftime("%Y-%m-%d-%H-%M")))
+    if not os.path.exists(model_dir) and rank == 0:
+        os.makedirs(model_dir)
+    if rank == 0:
+        print('====> output model will be saved in {}'.format(model_dir))
 
-    set_seed(args.seed)
+    # ----- BEGIN INITIALIZE RANDOM SEED -----
+    if args.distributed:
+        set_seed(args.seed + rank)
+    else:
+        set_seed(args.seed)
+    # ----- END INITIALIZE RANDOM SEED -----
+
+    if args.distributed:
+        if rank == 0:
+            print("Init the process group for distributed training")
+        torch.cuda.set_device(rank)
+        ddp_setup(rank=rank, world_size=args.world_size)
+
+        if rank == 0:
+            print("DDP progress group initialized successfully")
 
     # imbalance distribution
     # img_max * (imb_factor ** (cls_idx / (cls_num - 1.0))) 不平衡度为100
@@ -82,22 +112,38 @@ def main():
 
     train_set = IMBALANCECIFAR100(root='./datasets/data', imb_factor=0.01,
                                   rand_number=0, train=True, transform=data_transforms['advanced_train'])
-    train_loader = torch.utils.data.DataLoader(train_set,
-                                               batch_size=args.batch_size,
-                                               shuffle=True,
-                                               num_workers=16)
+    if args.distributed:
+        train_loader = torch.utils.data.DataLoader(train_set,
+                                                   batch_size=args.batch_size,
+                                                   shuffle=False,
+                                                   pin_memory=True,
+                                                   num_workers=16,
+                                                   sampler=DistributedSampler(train_set, num_replicas=args.world_size, rank=rank))
+    else:
+        train_loader = torch.utils.data.DataLoader(train_set,
+                                                   batch_size=args.batch_size,
+                                                   shuffle=True,
+                                                   pin_memory=True,
+                                                   num_workers=16)
     test_set = datasets.CIFAR100(
         root='./datasets/data', train=False, download=True, transform=data_transforms['test'])
     test_loader = torch.utils.data.DataLoader(test_set,
                                               batch_size=args.batch_size,
                                               shuffle=True,
-                                              num_workers=0)
-    print('size of testset_data:{}'.format(test_set.__len__()))
+                                              pin_memory=True,
+                                              num_workers=16)
+    logger.info('size of testset_data:{}'.format(test_set.__len__()))
+
+    best_epoch, start_epoch = 0, 1
     best_acc1 = .0  # 最佳精度1
 
+    # ----- BEGIN MODEL BUILDER -----
     model = resnet32(num_classes=100, use_norm=True,
                      num_exps=args.num_exps).to(device)
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
+    if args.distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    # ----- END MODEL BUILDER -----
 
     # optimizers and schedulers for decoupled training
     optimizer_feat = optim.SGD(  # 骨干特征提取网络的优化器
@@ -124,29 +170,38 @@ def main():
     criterion = nn.CrossEntropyLoss().cuda()  # 损失函数经典交叉熵损失
 
     if args.evaluate:
-        validate(test_loader, model, criterion, 179, args)
+        validate(test_loader, model, criterion, 180, args)
         return
 
     # proceeding with torch apex
     scaler = GradScaler()  # 创建GradScaler对象，自动混合精度，提速
 
-    for epoch in range(0, args.epochs):  # args.start_epoch
+    for epoch in range(start_epoch, args.epochs + 1):  # args.start_epoch
+
+        if args.distributed:
+            train_loader.sampler.set_epoch(epoch)
 
         # freezing shared parameters
-        if epoch >= args.cornerstone:  # 从第180个epoch开始冻结所有共享参数s
-            for name, param in model.named_parameters():
-                if name[:14] != "rt_classifiers":  # DDP NAME module.classifiers
-                    param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
+        if epoch > args.cornerstone:  # 从第180个epoch开始冻结所有共享参数s
+            if args.distributed:
+                for name, param in model.module.named_parameters():
+                    if name[:14] != "rt_classifiers":  # DDP NAME module.classifiers
+                        param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
+            else:
+                for name, param in model.named_parameters():
+                    if name[:14] != "rt_classifiers":  # DDP NAME module.classifiers
+                        param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
 
         # train for one epoch
-        train(train_loader if epoch >= args.cornerstone else train_loader, model, scaler,
-              optimizer_crt if epoch >= args.cornerstone else optimizer_feat, epoch, args)
+        train(train_loader if epoch > args.cornerstone else train_loader, model, scaler,
+              optimizer_crt if epoch > args.cornerstone else optimizer_feat, epoch, args,
+              logger, rank)
 
         # evaluate on validation set
-        acc1 = validate(test_loader, model, criterion, epoch, args)
+        acc1 = validate(test_loader, model, criterion, epoch, args, logger, rank)
 
         # adjust learning rate
-        if epoch >= args.cornerstone:
+        if epoch > args.cornerstone:
             scheduler_crt.step()
         else:
             scheduler_feat.step()
@@ -154,17 +209,27 @@ def main():
         # record best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
-        if is_best:
+        if is_best and rank == 0:
             print("Epoch {}, best acc1 = {}".format(epoch, best_acc1))
 
-        save_checkpoint(
-            {
-                'epoch': epoch + 1,
-                'architecture': "resnet32",
-                'state_dict': model.state_dict(),
-                'best_acc1': best_acc1,
-            }, is_best, feat=(epoch < args.cornerstone), epochs=args.epochs)
-    print("Training Finished, TotalEPOCH=%d" % args.epochs)
+        # ----- SAVE MODEL -----
+        if rank == 0:
+            if args.distributed:
+                state_dict = model.module.state_dict()
+            else:
+                state_dict = model.state_dict()
+            save_checkpoint(
+                {
+                    'epoch': epoch,
+                    'architecture': "resnet32",
+                    'state_dict': state_dict,
+                    'best_acc1': best_acc1,
+                }, model_dir, is_best, feat=(epoch < args.cornerstone), epoch=epoch, rank=rank)
+
+    logger.info("Training Finished, TotalEPOCH=%d, Best Acc=%f" % (args.epochs, best_acc1))
+
+    if args.distributed:
+        destroy_process_group()
 
 
 def mix_outputs(outputs, labels, balance=False, label_dis=None):
@@ -227,7 +292,7 @@ def mix_outputs(outputs, labels, balance=False, label_dis=None):
     return loss, avg_output
 
 
-def train(train_loader, model, scaler, optimizer, epoch, args):
+def train(train_loader, model, scaler, optimizer, epoch, args, logger, rank=0):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -252,9 +317,9 @@ def train(train_loader, model, scaler, optimizer, epoch, args):
         optimizer.zero_grad()
         # compute output
         with autocast():  # amp混合精度库前向传播
-            outputs = model(images, (epoch >= args.cornerstone))  # 前向传播使用torch.float16(2字节)精度
+            outputs = model(images, (epoch > args.cornerstone))  # 前向传播使用torch.float16(2字节)精度
             loss, output = mix_outputs(outputs=outputs, labels=target, balance=(
-                    epoch >= args.cornerstone), label_dis=args.label_dis)  # 计算损失值和3个专家的平均原始输出
+                    epoch > args.cornerstone), label_dis=args.label_dis)  # 计算损失值和3个专家的平均原始输出
         _, target = torch.max(target.data, 1)  # 获取正确标签的索引
 
         # measure accuracy and record loss
@@ -273,10 +338,10 @@ def train(train_loader, model, scaler, optimizer, epoch, args):
         end = time.time()
 
         if i % args.print_freq == 0:  # 每100个batch打印一次信息
-            progress.display(i)
+            progress.display(i, logger)
 
 
-def validate(val_loader, model, criterion, epoch, args):
+def validate(val_loader, model, criterion, epoch, args, logger, rank=0):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -294,7 +359,7 @@ def validate(val_loader, model, criterion, epoch, args):
             target = target.cuda(non_blocking=False)
 
             # compute output
-            outputs = model(images, (epoch >= args.cornerstone))
+            outputs = model(images, (epoch > args.cornerstone))
             output = sum(outputs) / len(outputs)  # 每一个类的logit等于3个专家的平均值
 
             loss = criterion(output, target)
@@ -311,22 +376,20 @@ def validate(val_loader, model, criterion, epoch, args):
             end = time.time()
 
             if i % args.print_freq == 0:
-                progress.display(i)
+                progress.display(i, logger)
 
         # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'.format(top1=top1,
-                                                                    top5=top5))
+        logger.info(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
     return top1.avg
 
 
-def save_checkpoint(state, is_best, feat, epochs, filename='cifar100_if100_demo'):
-    torch.save(state, f'ckp_{epochs}_{filename}.pth.tar')
+def save_checkpoint(state, model_dir, is_best, feat, epoch, rank=0):
+    if epoch % args.save_step == 0:
+        torch.save(state, os.path.join(model_dir, f'ckp_epoch_{epoch}.pth'))
     if is_best and feat:
-        shutil.copyfile(f'ckp_{epochs}_{filename}.pth.tar',
-                        f'{epochs}_{filename}_stage1.pth.tar')
+        torch.save(state, os.path.join(model_dir, f'best_stage1.pth'))
     elif is_best:
-        shutil.copyfile(f'ckp_{epochs}_{filename}.pth.tar',
-                        f'{epochs}_{filename}.pth.tar')
+        torch.save(state, os.path.join(model_dir, f'best_stage2.pth'))
 
 
 class AverageMeter(object):
@@ -360,10 +423,10 @@ class ProgressMeter(object):
         self.meters = meters
         self.prefix = prefix
 
-    def display(self, batch):
+    def display(self, batch, logger):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
+        logger.info('\t'.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
@@ -389,8 +452,15 @@ def accuracy(output, target, topk=(1,)):
         return res
 
 
+def ddp_setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+
 if __name__ == '__main__':
-    clock_start = datetime.datetime.now()
+    warnings.filterwarnings("ignore")
+    clock_start = datetime.now()
     main()
-    clock_end = datetime.datetime.now()
+    clock_end = datetime.now()
     print(clock_end - clock_start)
