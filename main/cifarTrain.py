@@ -329,7 +329,7 @@ def train(train_loader, model, scaler, optimizer, epoch, args, logger, rank=0):
         top1.update(acc1.item(), images.size(0))  # 更新top1准确率计数器
         top5.update(acc5.item(), images.size(0))  # 更新top5准确率计数器
 
-        scaler.scale(loss).backward(retain_graph=True)  # 使用float32进行反向传播，避免使用float16精度梯度下溢
+        scaler.scale(loss).backward()  # 使用float32进行反向传播，避免使用float16精度梯度下溢
         scaler.step(optimizer)
         scaler.update()  # 更新网络参数
 
