@@ -23,6 +23,7 @@ This MoE design is based on the implementation of Yerlan Idelbayev.
 
 from collections import OrderedDict
 from turtle import forward
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -176,7 +177,7 @@ class ResNet_MoE(nn.Module):
         self.depth = list(  # 定义网络深度
             reversed([i + 1 for i in range(len(num_blocks) - 1)]))  # [2, 1]
         self.exp_depth = [self.depth[i % len(self.depth)] for i in range(  # 定义专家分配到的网络深度
-            self.num_experts)]  # [2, 1, 2]
+            self.num_experts)]  # [2, 1 , 2]
         feat_dim = 16
         self.shallow_exps = nn.ModuleList([ShallowExpert(  # 构建浅层的专家的对齐下采样层
             input_dim=feat_dim * (2 ** (d % len(self.depth))), depth=d) for d in self.exp_depth])
@@ -210,18 +211,21 @@ class ResNet_MoE(nn.Module):
                         for i in range(self.num_experts)]
             exp_outs = [F.avg_pool2d(output, output.size()[3]).view(  # 全局平均池化(bs, 64, 1, 1)
                 output.size(0), -1) for output in exp_outs]  # 然后拉平(bs, 64)
+            embeddings = exp_outs
+
             if crt == True:  # 分类器训练
                 outs = [self.s * self.rt_classifiers[i]
-                (exp_outs[i]) for i in range(self.num_experts)]
+                (embeddings[i]) for i in range(self.num_experts)]
             else:  # 特征提取网络训练
                 outs = [self.s * self.classifiers[i]  # 为什么要点乘`self.s`？分类器是`NormedLinear`
-                (exp_outs[i]) for i in range(self.num_experts)]  # 分类器输出(bs, 100)
+                (embeddings[i]) for i in range(self.num_experts)]  # 分类器输出(bs, 100)
         else:
             out3 = self.layer3(out2)
             out = F.avg_pool2d(out3, out3.size()[3]).view(out3.size(0), -1)
+            embeddings = out
             outs = self.linear(out)
 
-        return outs
+        return outs, embeddings
 
 
 # for Cifar100-LT use

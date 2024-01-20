@@ -13,7 +13,8 @@ from datetime import datetime
 
 
 def get_logger(args, rank):
-    log_dir = os.path.join(args.output_dir, args.cfg_name, 'logs')
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    log_dir = os.path.join(args.output_dir, args.cfg_name, 'logs', date_str)
     if not os.path.exists(log_dir) and rank == 0:
         os.makedirs(log_dir)
     time_str = datetime.now().strftime('%Y-%m-%d-%H-%M')

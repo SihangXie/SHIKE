@@ -11,6 +11,7 @@ class IMBALANCECIFAR10(torchvision.datasets.CIFAR10):
                  transform=None, target_transform=None,
                  download=True):
         super(IMBALANCECIFAR10, self).__init__(root, train, transform, target_transform, download)
+        self.idx_targets = []  # 类别ID格式的标签
         # print(rand_number)
         np.random.seed(0)
         img_num_list = self.get_img_num_per_cls(self.cls_num, imb_type, imb_factor)
@@ -49,7 +50,8 @@ class IMBALANCECIFAR10(torchvision.datasets.CIFAR10):
         new_data = np.vstack(new_data)
         self.data = new_data
         print(len(self.data))
-        self.targets = to_categorical(new_targets)
+        self.targets = to_categorical(new_targets)  # TODO 标签在此处被转化为one-hot格式
+        self.idx_targets = new_targets
 
     def get_cls_num_list(self):
         cls_num_list = []

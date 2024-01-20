@@ -2,9 +2,11 @@ import argparse
 import os
 from datetime import datetime
 import _init_paths
+import matplotlib.pyplot as plt
 
 from utils.utils import get_logger
 import warnings
+import numpy as np
 
 import torch.optim as optim
 import torchvision.datasets as datasets
@@ -16,8 +18,11 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.cuda.amp import autocast as autocast, GradScaler
 from dataset.autoaugment import CIFAR10Policy, Cutout
 from dataset.imbalanced_cifar import *
+from dataset.imbalanced_cifar_contrastive import *
 from network.networks import resnet32
 from utils.util import *
+from dataset.class_sampler import MPerClassSampler
+from loss.imagenet_sup_mcl_loss import Sup_MCL_Loss
 
 # data transform settings
 normalize = transforms.Normalize(
@@ -48,20 +53,35 @@ parser = argparse.ArgumentParser(description='PyTorch CIFAR-LT Training')
 parser.add_argument('--cfg_name', default='CIFAR100-LT-IF100', help='name of this configuration')
 parser.add_argument('--output_dir', default='/home/og/XieSH/models/SHIKE/output', help='folder to output images and model checkpoints')
 parser.add_argument('--pre_epoch', default=0, help='epoch for pre-training')
-parser.add_argument('--epochs', default=200, help='epoch for augmented training')
+parser.add_argument('--epochs', default=320, help='epoch for augmented training')
 parser.add_argument('--batch_size', default=128)
 parser.add_argument('--learning_rate', default=0.05)
-parser.add_argument('--seed', default=123, help='keep all seeds fixed')
+parser.add_argument('--seed', default=3407, help='keep all seeds fixed')
 parser.add_argument('--re_train', default=True, help='implement cRT')
-parser.add_argument('--cornerstone', default=180)
+parser.add_argument('--cornerstone', default=300)
 parser.add_argument('--num_exps', default=3, help='number of experts')
 parser.add_argument('--distributed', default=False, help='use distributed data parallel training or not')  # 是否启用分布式训练
 parser.add_argument('--local_rank', default=0, type=int, help='local_rank for distributed training')  # DDP训练的进程ID
 parser.add_argument('--world_size', default=2, type=int, help='number of processes for distributed training')  # DDP训练的进程总数
 parser.add_argument('--save_step', default=50, type=int, help='number of processes for distributed training')  # DDP训练的进程总数
+parser.add_argument('--feat_dim', default=128, type=int, help='feature dimension')  # 对比学习时embedding维度
+parser.add_argument('--contrastive_sampler', default=False, type=bool, help='m per class sampler for mcl contrastive learning')  # 对比学习正负样本采样器
+
+parser.add_argument('--kd_T', default=3., type=float, help='temperature of KL-divergence')  # 对比学习时embedding维度
+parser.add_argument('--tau', default=0.1, type=float, help='temperature for contrastive distribution')
+parser.add_argument('--alpha', default=0.1, type=float, help='weight balance for VCL')
+parser.add_argument('--gamma', default=1, type=float, help='weight balance for Soft VCL')
+parser.add_argument('--beta', default=0.1, type=float, help='weight balance for ICL')
+parser.add_argument('--lam', default=1., type=float, help='weight balance for Soft ICL')
+parser.add_argument('--rep_dim', default=64, type=int, help='penultimate dimension')
+parser.add_argument('--pos_k', default=1, type=int, help='number of positive samples for NCE')
+parser.add_argument('--neg_k', default=8192, type=int, help='number of negative samples for NCE')
+parser.add_argument('--nce_m', default=0.5, type=float, help='momentum for non-parametric updates')
+parser.add_argument('--contrastive_dataset', default=True, type=bool, help='whether apply memory bank dataset or not')
 parser.add_argument('-e',
                     '--evaluate',
                     dest='evaluate',
+                    default=False,
                     action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('-p',
@@ -74,12 +94,11 @@ args = parser.parse_args()
 
 
 def main():
-    # os.environ['CUDA_VISIBLE_DEVICES'] = '3,4'  # 指定可用的GPU
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
     rank = args.local_rank
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger = get_logger(args=args, rank=rank)
     model_dir = os.path.join(args.output_dir, args.cfg_name, 'models',
                              str(datetime.now().strftime("%Y-%m-%d-%H-%M")))
@@ -92,6 +111,7 @@ def main():
     if args.distributed:
         set_seed(args.seed + rank)
     else:
+        # pass
         set_seed(args.seed)
     # ----- END INITIALIZE RANDOM SEED -----
 
@@ -110,21 +130,32 @@ def main():
                     for i in range(100)])
     args.label_dis = num  # 每类的样本数
 
-    train_set = IMBALANCECIFAR100(root='/home/og/XieSH/dataset/long-tailed/public', imb_factor=0.01,
-                                  rand_number=0, train=True, transform=data_transforms['advanced_train'])
-    if args.distributed:
-        train_loader = torch.utils.data.DataLoader(train_set,
-                                                   batch_size=args.batch_size,
-                                                   shuffle=False,
-                                                   pin_memory=True,
-                                                   num_workers=16,
-                                                   sampler=DistributedSampler(train_set, num_replicas=args.world_size, rank=rank))
+    # 构建训练集，控制是否构建memory bank的对比学习数据集
+    if args.contrastive_dataset:
+        train_set = IMBALANCECIFAR100_CONTRASTIVE(root='/home/og/XieSH/dataset/long-tailed/public', imb_factor=0.01,
+                                                  rand_number=0, train=True, transform=data_transforms['advanced_train'],
+                                                  args=args, is_sample=True)
     else:
-        train_loader = torch.utils.data.DataLoader(train_set,
-                                                   batch_size=args.batch_size,
-                                                   shuffle=True,
-                                                   pin_memory=True,
-                                                   num_workers=16)
+        train_set = IMBALANCECIFAR100(root='/home/og/XieSH/dataset/long-tailed/public', imb_factor=0.01,
+                                      rand_number=0, train=True, transform=data_transforms['advanced_train'])
+
+    # 定义训练集采样器
+    if args.distributed:
+        train_sampler = DistributedSampler(train_set, num_replicas=args.world_size, rank=rank)
+    elif args.contrastive_sampler:
+        train_sampler = MPerClassSampler(labels=train_set.idx_targets, m=2,
+                                         batch_size=args.batch_size,
+                                         length_before_new_iter=len(train_set.targets))
+    else:
+        train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(train_set,
+                                               batch_size=args.batch_size,
+                                               shuffle=(train_sampler is None),
+                                               pin_memory=True,
+                                               num_workers=16,
+                                               sampler=train_sampler)
+
     test_set = datasets.CIFAR100(
         root='/home/og/XieSH/dataset/long-tailed/public', train=False, download=True, transform=data_transforms['test'])
     test_loader = torch.utils.data.DataLoader(test_set,
@@ -133,6 +164,7 @@ def main():
                                               pin_memory=True,
                                               num_workers=16)
     logger.info('size of testset_data:{}'.format(test_set.__len__()))
+    args.n_data = len(train_set)
 
     best_epoch, start_epoch = 0, 1
     best_acc1 = .0  # 最佳精度1
@@ -143,13 +175,18 @@ def main():
     if args.distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-    # ----- END MODEL BUILDER -----
+
+    # ----- BEGIN LOSS BUILDER -----
+    criterion_mcl = Sup_MCL_Loss(args).to(device)  # 初始化MCL损失函数
 
     # optimizers and schedulers for decoupled training
+    trainable_list = nn.ModuleList([])  # 可学习的网络参数列表
+    trainable_list.append(model)
+    trainable_list.append(criterion_mcl.embed_list)
     optimizer_feat = optim.SGD(  # 骨干特征提取网络的优化器
-        model.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=5e-4)
+        trainable_list.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=5e-4)
     optimizer_crt = optim.SGD(  # 分类器的优化器
-        model.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=5e-4)
+        trainable_list.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=5e-4)
     scheduler_feat = CosineAnnealingLRWarmup(  # 骨干特征提取网络的学习率调度器
         optimizer=optimizer_feat,
         T_max=args.epochs - 20,
@@ -170,41 +207,46 @@ def main():
     criterion = nn.CrossEntropyLoss().cuda()  # 损失函数经典交叉熵损失
 
     if args.evaluate:
-        validate(test_loader, model, criterion, 180, args)
+        validate(test_loader, model, criterion, 180, args, logger)
         return
 
     # proceeding with torch apex
     scaler = GradScaler()  # 创建GradScaler对象，自动混合精度，提速
 
-    for epoch in range(start_epoch, args.epochs + 1):  # args.start_epoch
-
+    # 记录学习率变化
+    lr_list = []
+    for epoch in range(0, args.epochs):  # args.start_epoch
         if args.distributed:
             train_loader.sampler.set_epoch(epoch)
 
         # freezing shared parameters
-        if epoch > args.cornerstone:  # 从第180个epoch开始冻结所有共享参数s
+        if epoch >= args.cornerstone:  # 从第180个epoch开始冻结所有共享参数s
             if args.distributed:
                 for name, param in model.module.named_parameters():
                     if name[:14] != "rt_classifiers":  # DDP NAME module.classifiers
                         param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
             else:
-                for name, param in model.named_parameters():
-                    if name[:14] != "rt_classifiers":  # DDP NAME module.classifiers
+                for name, param in trainable_list.named_parameters():
+                    if name[2:16] != "rt_classifiers":  # DDP NAME module.classifiers
                         param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
+        if epoch == args.cornerstone + 1:
+            logger.info('====> rt_classifier parameter begin update: {}'.format(trainable_list[0].rt_classifiers[0].weight.requires_grad))
 
         # train for one epoch
-        train(train_loader if epoch > args.cornerstone else train_loader, model, scaler,
-              optimizer_crt if epoch > args.cornerstone else optimizer_feat, epoch, args,
-              logger, rank)
+        train(train_loader if epoch >= args.cornerstone else train_loader, model, scaler,
+              optimizer_crt if epoch >= args.cornerstone else optimizer_feat, criterion_mcl,
+              epoch, args, logger, rank)
 
         # evaluate on validation set
         acc1 = validate(test_loader, model, criterion, epoch, args, logger, rank)
 
         # adjust learning rate
-        if epoch > args.cornerstone:
+        if epoch >= args.cornerstone:
             scheduler_crt.step()
+            lr_list.append(optimizer_crt.state_dict()['param_groups'][0]['lr'])
         else:
             scheduler_feat.step()
+            lr_list.append(optimizer_feat.state_dict()['param_groups'][0]['lr'])
 
         # record best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -227,23 +269,30 @@ def main():
                 }, model_dir, is_best, feat=(epoch < args.cornerstone), epoch=epoch, rank=rank)
 
     logger.info("Training Finished, TotalEPOCH=%d, Best Acc=%f" % (args.epochs, best_acc1))
+    plt.plot(range(0, 320), lr_list)
+    try:
+        plt.savefig('learning_rate.pdf')
+        print('Successfully saved figure')
+    except Exception as e:
+        print(str(e))
+    plt.show()  # 显示学习率图片
 
     if args.distributed:
         destroy_process_group()
 
 
-def mix_outputs(outputs, labels, balance=False, label_dis=None):
-    logits_rank = outputs[0].unsqueeze(1)  # 在第二维上插入1个新的维度作为logits排名
-    for i in range(len(outputs) - 1):  # i取值(0, 1)
+def mix_outputs(logits, embeddings, criterion_mcl, labels, pos_idx, neg_idx, balance=False, label_dis=None):
+    logits_rank = logits[0].unsqueeze(1)  # 在第二维上插入1个新的维度作为logits排名
+    for i in range(len(logits) - 1):  # i取值(0, 1)
         logits_rank = torch.cat(  # 水平方向拼接logits排名(bs, 3, 100)
-            (logits_rank, outputs[i + 1].unsqueeze(1)), dim=1)  # 其实就是把3个专家的分类头输出拼接到一个(bs, 3, 100)的张量
+            (logits_rank, logits[i + 1].unsqueeze(1)), dim=1)  # 其实就是把3个专家的分类头输出拼接到一个(bs, 3, 100)的张量
 
     max_tea, max_idx = torch.max(logits_rank, dim=1)  # 获取同一个类中，3个专家logits值最高的值与专家的索引作为教师模型teacher
     # min_tea, min_idx = torch.min(logits_rank, dim=1)
 
     non_target_labels = torch.ones_like(labels) - labels  # 获取non target labels，target logit值会变0，相当于掩码
 
-    avg_logits = torch.sum(logits_rank, dim=1) / len(outputs)  # 计算3个专家输出的logits的均值(沿专家维度算平均值)
+    avg_logits = torch.sum(logits_rank, dim=1) / len(logits)  # 计算3个专家输出的logits的均值(沿专家维度算平均值)
     non_target_logits = (-30 * labels) + avg_logits * non_target_labels  # 【重要】×-30后target logit值会变-30.基于平均logits，计算non target logits
 
     _hardest_nt, hn_idx = torch.max(non_target_logits, dim=1)  # 【重要】计算`consensus hardest negative class`及其索引
@@ -255,7 +304,7 @@ def mix_outputs(outputs, labels, balance=False, label_dis=None):
     rest_nt_logits = max_tea * (1 - hardest_idx) * (1 - labels)  # 排除target logit和consensus hardest negative class的剩余最大non target logits
     reformed_nt = rest_nt_logits + hardest_logit  # 【重要】得到全部non target logits的值作为教师模型
 
-    preds = [F.softmax(logits) for logits in outputs]  # 计算三个专家原始输出的prediction
+    preds = [F.softmax(logit) for logit in logits]  # 计算三个专家原始输出的prediction
 
     reformed_non_targets = []  # 初始化空列别
     for i in range(len(preds)):  # 循环3次
@@ -264,35 +313,43 @@ def mix_outputs(outputs, labels, balance=False, label_dis=None):
         target_preds = torch.sum(target_preds, dim=-1, keepdim=True)  # 将其他99个0值清除
         target_min = -30 * labels  # 还是没搞清楚为什么要乘-30？
         target_excluded_preds = F.softmax(  # 计算排除了target logit的prediction
-            outputs[i] * (1 - labels) + target_min)
+            logits[i] * (1 - labels) + target_min)
         reformed_non_targets.append(target_excluded_preds)  # 把每个专家的non target prediction加到列表中
 
     label_dis = torch.tensor(  # 把每类的样本数转换成Tensor
         label_dis, dtype=torch.float, requires_grad=False).cuda()
     label_dis = label_dis.unsqueeze(0).expand(labels.shape[0], -1)  # 把label_dis形状从(100,)修改成(bs, 100)
+
     loss = 0.0
+
+    targets = torch.argmax(labels, dim=1)
     if balance == True:  # epoch超过180进入该分支，表示训练分类器
-        for i in range(len(outputs)):  # 循环3次计算分类器损失，最后损失之求和
-            loss += soft_entropy(outputs[i] + label_dis.log(), labels)
+        for i in range(len(logits)):  # 循环3次计算分类器损失，最后损失之求和
+            loss += soft_entropy(logits[i] + label_dis.log(), labels)  # BSCE平衡Softmax CE
     else:  # epoch小于180进入该分支，表示训练backbone
-        for i in range(len(outputs)):  # 循环3次
+        for i in range(len(logits)):  # 循环3次
             # base ce
-            loss += soft_entropy(outputs[i], labels)  # 计算每个专家的交叉熵损失函数
+            loss += soft_entropy(logits[i], labels)  # 计算每个专家的交叉熵损失函数
             # hardest negative suppression
             loss += 10.0 * \
                     F.kl_div(  # KL散度
                         torch.log(reformed_non_targets[i]), F.softmax(reformed_nt))  # 计算每个专家的non target logits与教师模型的KL散度
             # mutual distillation loss
-            for j in range(len(outputs)):  # DKF两两专家之间进行知识蒸馏
+            for j in range(len(logits)):  # DKF两两专家之间进行知识蒸馏
                 if i != j:
-                    loss += F.kl_div(F.log_softmax(outputs[i]),
-                                     F.softmax(outputs[j]))
+                    loss += F.kl_div(F.log_softmax(logits[i]),
+                                     F.softmax(logits[j]))
+        # 计算MCL损失
+        loss_vcl, loss_soft_vcl, loss_icl, loss_soft_icl = criterion_mcl(embeddings, pos_idx, neg_idx)
+        loss_mcl = args.alpha * loss_vcl + args.gamma * loss_soft_vcl \
+                   + args.beta * loss_icl + args.lam * loss_soft_icl
+        loss += loss_mcl
 
-    avg_output = sum(outputs) / len(outputs)  # 计算多专家原始平均输出
+    avg_output = sum(logits) / len(logits)  # 计算多专家原始平均输出
     return loss, avg_output
 
 
-def train(train_loader, model, scaler, optimizer, epoch, args, logger, rank=0):
+def train(train_loader, model, scaler, optimizer, criterion_mcl, epoch, args, logger, rank=0):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -307,19 +364,24 @@ def train(train_loader, model, scaler, optimizer, epoch, args, logger, rank=0):
 
     end = time.time()
     # worst_case_per_round = None
-    for i, (images, target) in enumerate(train_loader):
+    for i, (images, target, pos_idx, neg_idx) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
+        pos_idx = pos_idx.cuda().long()
+        neg_idx = neg_idx.cuda().long()
 
         optimizer.zero_grad()
         # compute output
         with autocast():  # amp混合精度库前向传播
-            outputs = model(images, (epoch > args.cornerstone))  # 前向传播使用torch.float16(2字节)精度
-            loss, output = mix_outputs(outputs=outputs, labels=target, balance=(
-                    epoch > args.cornerstone), label_dis=args.label_dis)  # 计算损失值和3个专家的平均原始输出
+            logits, embeddings = model(images, (epoch >= args.cornerstone))  # 前向传播使用torch.float16(2字节)精度
+            loss, output = mix_outputs(logits=logits, embeddings=embeddings,
+                                       criterion_mcl=criterion_mcl,
+                                       labels=target, pos_idx=pos_idx, neg_idx=neg_idx,
+                                       balance=(epoch >= args.cornerstone),
+                                       label_dis=args.label_dis)  # 计算损失值和3个专家的平均原始输出
         _, target = torch.max(target.data, 1)  # 获取正确标签的索引
 
         # measure accuracy and record loss
@@ -359,7 +421,7 @@ def validate(val_loader, model, criterion, epoch, args, logger, rank=0):
             target = target.cuda(non_blocking=False)
 
             # compute output
-            outputs = model(images, (epoch > args.cornerstone))
+            outputs, embeddings = model(images, (epoch >= args.cornerstone))
             output = sum(outputs) / len(outputs)  # 每一个类的logit等于3个专家的平均值
 
             loss = criterion(output, target)
@@ -459,6 +521,7 @@ def ddp_setup(rank, world_size):
 
 
 if __name__ == '__main__':
+    os.environ["CUDA_VISIBLE_DEVICES"] = '2'  # 指定可用的GPU
     warnings.filterwarnings("ignore")
     clock_start = datetime.now()
     main()
