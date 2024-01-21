@@ -53,16 +53,16 @@ parser = argparse.ArgumentParser(description='PyTorch CIFAR-LT Training')
 parser.add_argument('--cfg_name', default='CIFAR100-LT-IF100', help='name of this configuration')
 parser.add_argument('--output_dir', default='/home/og/XieSH/models/SHIKE/output', help='folder to output images and model checkpoints')
 parser.add_argument('--pre_epoch', default=0, help='epoch for pre-training')
-parser.add_argument('--epochs', default=320, help='epoch for augmented training')
+parser.add_argument('--epochs', default=400, help='epoch for augmented training')
 parser.add_argument('--batch_size', default=128)
 parser.add_argument('--learning_rate', default=0.05)
 parser.add_argument('--seed', default=3407, help='keep all seeds fixed')
 parser.add_argument('--re_train', default=True, help='implement cRT')
-parser.add_argument('--cornerstone', default=300)
+parser.add_argument('--cornerstone', default=380)
 parser.add_argument('--num_exps', default=3, help='number of experts')
 parser.add_argument('--distributed', default=False, help='use distributed data parallel training or not')  # 是否启用分布式训练
 parser.add_argument('--local_rank', default=0, type=int, help='local_rank for distributed training')  # DDP训练的进程ID
-parser.add_argument('--world_size', default=2, type=int, help='number of processes for distributed training')  # DDP训练的进程总数
+parser.add_argument('--world_size', default=4, type=int, help='number of processes for distributed training')  # DDP训练的进程总数
 parser.add_argument('--save_step', default=50, type=int, help='number of processes for distributed training')  # DDP训练的进程总数
 parser.add_argument('--feat_dim', default=128, type=int, help='feature dimension')  # 对比学习时embedding维度
 parser.add_argument('--contrastive_sampler', default=False, type=bool, help='m per class sampler for mcl contrastive learning')  # 对比学习正负样本采样器
@@ -98,7 +98,7 @@ def main():
         os.makedirs(args.output_dir)
 
     rank = args.local_rank
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger = get_logger(args=args, rank=rank)
     model_dir = os.path.join(args.output_dir, args.cfg_name, 'models',
                              str(datetime.now().strftime("%Y-%m-%d-%H-%M")))
@@ -193,7 +193,7 @@ def main():
         eta_min=0.0,
         warmup_epochs=5,
         base_lr=args.learning_rate,
-        warmup_lr=0.15
+        warmup_lr=0.20
     )
     scheduler_crt = CosineAnnealingLRWarmup(  # 分类器的学习率调度器
         optimizer=optimizer_crt,
@@ -222,15 +222,18 @@ def main():
         # freezing shared parameters
         if epoch >= args.cornerstone:  # 从第180个epoch开始冻结所有共享参数s
             if args.distributed:
-                for name, param in model.module.named_parameters():
-                    if name[:14] != "rt_classifiers":  # DDP NAME module.classifiers
+                for name, param in trainable_list.named_parameters():
+                    if "rt_classifiers" not in name:  # DDP NAME module.classifiers
                         param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
             else:
                 for name, param in trainable_list.named_parameters():
                     if name[2:16] != "rt_classifiers":  # DDP NAME module.classifiers
                         param.requires_grad = False  # 除了分类器，其他层的参数全部冻结
-        if epoch == args.cornerstone + 1:
+        if epoch == args.cornerstone:
             logger.info('====> rt_classifier parameter begin update: {}'.format(trainable_list[0].rt_classifiers[0].weight.requires_grad))
+
+            # if rank == 0:
+            #     logger.info('====> trainable_list parameters: {}'.format(trainable_list.named_parameters()))
 
         # train for one epoch
         train(train_loader if epoch >= args.cornerstone else train_loader, model, scaler,
@@ -257,9 +260,9 @@ def main():
         # ----- SAVE MODEL -----
         if rank == 0:
             if args.distributed:
-                state_dict = model.module.state_dict()
+                state_dict = trainable_list.state_dict()
             else:
-                state_dict = model.state_dict()
+                state_dict = trainable_list.state_dict()
             save_checkpoint(
                 {
                     'epoch': epoch,
@@ -269,7 +272,7 @@ def main():
                 }, model_dir, is_best, feat=(epoch < args.cornerstone), epoch=epoch, rank=rank)
 
     logger.info("Training Finished, TotalEPOCH=%d, Best Acc=%f" % (args.epochs, best_acc1))
-    plt.plot(range(0, 320), lr_list)
+    plt.plot(range(0, 400), lr_list)
     try:
         plt.savefig('learning_rate.pdf')
         print('Successfully saved figure')
