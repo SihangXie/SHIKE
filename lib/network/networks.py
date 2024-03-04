@@ -227,6 +227,28 @@ class ResNet_MoE(nn.Module):
 
         return outs, embeddings
 
+    def load_model(self, model_path, **kwargs):
+        pretrain_dict = torch.load(
+            model_path, map_location="cuda"
+        )
+        pretrain_dict = pretrain_dict['state_dict'] if 'state_dict' in pretrain_dict else pretrain_dict
+        model_dict = self.state_dict()
+        from collections import OrderedDict
+        new_dict = OrderedDict()
+        for k, v in pretrain_dict.items():
+            if 'backbone_only' in kwargs.keys() and 'classifier' in k:
+                continue;
+            if k.startswith("module"):
+                if k[7:] not in model_dict.keys():
+                    print('not load:{}'.format(k))
+                    continue
+                new_dict[k[7:]] = v
+            else:
+                new_dict[k] = v
+        model_dict.update(new_dict)
+        self.load_state_dict(model_dict)
+        print("All model has been loaded...")
+
 
 # for Cifar100-LT use
 
